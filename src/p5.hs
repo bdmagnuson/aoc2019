@@ -2,18 +2,21 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
 
-import Data.Array
 import Debug.Trace
 import Control.Monad
 import Control.Monad.State
 import Control.Lens
-import qualified Data.Intmap as M
+import Debug.Trace
+import qualified Data.IntMap.Strict as M
 
 data St = St {
     _pc   :: Int,
-    _prog :: M.IntMap Int
-    _output :: [Int]
-}
+    _prog :: M.IntMap Int,
+    _output :: [Int],
+    _inval :: Int
+} deriving (Show)
+
+makeLenses ''St
 
 
 data Opcode =
@@ -21,24 +24,35 @@ data Opcode =
   Mult   |
   Input  |
   Output |
-  Halt
+  JIfT   |
+  JIfF   |
+  Lt     |
+  Equal     |
+  Halt deriving (Show)
 
-opSize Add  = 4
-opSize Mult = 4
-opSize Halt = 1
-opSize Input = 2
-opSize Ouptut = 2
+opSize Add    = 4
+opSize Mult   = 4
+opSize Halt   = 1
+opSize Input  = 2
+opSize Output = 2
+opSize JIfT   = 3
+opSize JIfF   = 3
+opSize Lt     = 4
+opSize Equal  = 4
 
-Mode = Pos | Imm
+type Addr = Int
+data Mode
+  = Pos
+  | Imm deriving  (Show)
 
 data Inst = Inst {
     op :: Opcode,
     opa :: Int,
     opb :: Int,
-    opd :: Int
-    modea :: Mode
+    opd :: Int,
+    modea :: Mode,
     modeb :: Mode
-}
+} deriving (Show)
 
 update :: Addr -> Int -> State St ()
 update k v = prog %= M.insert k v
@@ -47,73 +61,139 @@ fetch :: Addr -> State St Int
 fetch a = do
     p <- use prog
     case p ^? ix a of
-        nothing -> error "bad addr"
-        just a -> return a
+        Nothing -> error "bad addr"
+        Just a -> return a
 
 fromInt 0 = Pos
 fromInt 1 = Imm
 
 decode :: State St Inst
 decode = do
-    pc'  <- use pc
-    inst <- fetch pc'
-    let (rest, op) = inst `divmod` 100
-    let (rest, m1) = rest `divmod` 10
-    let (rest, m2) = rest `divmod` 10
-    case fetch op of
+    pc' <- use pc
+    inst <- use pc >>= fetch
+    let (rest, op)  = inst `divMod` 100
+    let (rest', m1) = rest `divMod` 10
+    let (_, m2)     = rest' `divMod` 10
+    case op of
         1 -> do
                op1 <- fetch (pc' + 1)
                op2 <- fetch (pc' + 2)
                opd <- fetch (pc' + 3)
-               return $ inst add op1 op2 opd (fromint m1) (fromint m2)
+               return $ Inst Add op1 op2 opd (fromInt m1) (fromInt m2)
         2 -> do
                op1 <- fetch (pc' + 1)
                op2 <- fetch (pc' + 2)
                opd <- fetch (pc' + 3)
-               return $ inst mult op1 op2 opd (fromint m1) (fromint m2)
-        3 -> do 
+               return $ Inst Mult op1 op2 opd (fromInt m1) (fromInt m2)
+        3 -> do
                op1 <- fetch (pc' + 1)
-               return $ input op1 0 0
-        5
-        _ -> return halt
+               return $ Inst Input op1 0 0 Imm Imm
+        4 -> do
+               op1 <- fetch (pc' + 1)
+               return $ Inst Output op1 0 0 Imm Imm
+        5 -> do
+               op1 <- fetch (pc' + 1)
+               op2 <- fetch (pc' + 2)
+               return $ Inst JIfT op1 op2 0 (fromInt m1) (fromInt m2)
+        6 -> do
+               op1 <- fetch (pc' + 1)
+               op2 <- fetch (pc' + 2)
+               return $ Inst JIfF op1 op2 0 (fromInt m1) (fromInt m2)
+        7 -> do
+               op1 <- fetch (pc' + 1)
+               op2 <- fetch (pc' + 2)
+               opd <- fetch (pc' + 3)
+               return $ Inst Lt op1 op2 opd (fromInt m1) (fromInt m2)
+        8 -> do
+               op1 <- fetch (pc' + 1)
+               op2 <- fetch (pc' + 2)
+               opd <- fetch (pc' + 3)
+               return $ Inst Equal op1 op2 opd (fromInt m1) (fromInt m2)
+        _ -> return $ Inst Halt 0 0 0 Imm Imm
 
 execute :: Inst -> State St Bool
-execute (inst op a b d am bm dm) = do
-    pc %= (+ (opSize op))
+execute w@(Inst op a b d am bm) = do
     case op of
         Add -> do
+           pc += opSize op
            op1 <- case am of
-                     imm -> return a
-                     pos -> fetch a
+                     Imm -> return a
+                     Pos -> fetch a
            op2 <- case bm of
-                     imm -> return b
-                     pos -> fetch b
-           prog %= M.insert d (op1 + op2)
+                     Imm -> return b
+                     Pos -> fetch b
+           update d (op1 + op2)
            return True
         Mult -> do
-           op1 <- fetch a
-           op2 <- fetch b
-           prog %= M.insert d (op1 * op2)
+           pc += opSize op
+           op1 <- case am of
+                     Imm -> return a
+                     Pos -> fetch a
+           op2 <- case bm of
+                     Imm -> return b
+                     Pos -> fetch b
+           update d (op1 * op2)
            return True
         Input -> do
-           prog %= M.insert a 1
+           pc += opSize op
+           inval' <- use inval
+           update a inval'
+           return True
         Output -> do
-           op1 <- case am of
-                     imm -> return b
-                     pos -> fetch b
+           pc += opSize op
+           op1 <- fetch a
            output %= (++ [op1])
+           return True
+        JIfT -> do
+           op1 <- case am of
+                     Imm -> return a
+                     Pos -> fetch a
+           op2 <- case bm of
+                     Imm -> return b
+                     Pos -> fetch b
+           (if op1 /= 0 then pc .= op2
+                        else pc += (opSize op)) >> return True
+        JIfF -> do
+           op1 <- case am of
+                     Imm -> return a
+                     Pos -> fetch a
+           op2 <- case bm of
+                     Imm -> return b
+                     Pos -> fetch b
+           (if op1 == 0 then pc .= op2
+                        else pc += (opSize op)) >> return True
+        Lt -> do
+           pc += opSize op
+           op1 <- case am of
+                     Imm -> return a
+                     Pos -> fetch a
+           op2 <- case bm of
+                     Imm -> return b
+                     Pos -> fetch b
+           update d (if op1 < op2 then 1 else 0)
+           return True
+        Equal -> do
+           pc += opSize op
+           op1 <- case am of
+                     Imm -> return a
+                     Pos -> fetch a
+           op2 <- case bm of
+                     Imm -> return b
+                     Pos -> fetch b
+           update d (if op1 == op2 then 1 else 0)
            return True
         Halt -> return False
 
-run prog = doit init
+run prog input = doit init
     where doit st = case runState (decode >>= execute) st of
                           (False, st') -> st'
                           (True, st')  -> doit st'
-          init = St 0 prog []
+          init = St 0 prog [] input
 
-getoutput p = (run input) ^. output
+getoutput x = (run input x) ^. output
 
-input = M.fromlist . zip [0..1]
+input :: M.IntMap Int
+input = M.fromList $ zip ([0..] :: [Int])
   [3, 225, 1, 225, 6, 6, 1100, 1, 238, 225, 104, 0, 1102, 46, 47, 225, 2, 122,
   130, 224, 101, -1998, 224, 224, 4, 224, 1002, 223, 8, 223, 1001, 224, 6, 224,
   1, 224, 223, 223, 1102, 61, 51, 225, 102, 32, 92, 224, 101, -800, 224, 224, 4,
